@@ -78,12 +78,29 @@ class ACTConfig(PreTrainedConfig):
         dropout: Dropout to use in the transformer layers (see code for details).
         kl_weight: The weight to use for the KL-divergence component of the loss if the variational objective
             is enabled. Loss is then calculated as: `reconstruction_loss + kl_weight * kld_loss`.
+        action_delta_offset: Shifts the sampled action window forward by this many frames, so the chunk
+            becomes the actions at t+offset .. t+offset+chunk_size-1 while the observation stays at t.
+            See the field's own comment for when to set it.
     """
 
     # Input / output structure.
     n_obs_steps: int = 1
     chunk_size: int = 100
     n_action_steps: int = 100
+
+    # Shifts the sampled action window forward by this many frames: the chunk becomes the actions at
+    # t+offset .. t+offset+chunk_size-1 while the observation stays at t.
+    #
+    # The default 0 is right for teleoperated datasets, where action[t] is a commanded target that
+    # genuinely differs from the observed state[t]. It is degenerate for datasets recorded from a
+    # device that has no separate commanded signal -- a motion-capture glove or an exoskeleton, where
+    # action[t] IS state[t] by construction. There, chunk step 0 trains the policy to predict "stay
+    # exactly where you are". Setting this to 1 makes every chunk step a real motion.
+    #
+    # Mirrors GrootConfig.action_delta_offset, and deliberately so: the shift is a property of how the
+    # action window is sampled relative to the observation, not of the policy architecture, so the two
+    # policies must express it the same way for an ACT/GR00T A/B on one dataset to mean anything.
+    action_delta_offset: int = 0
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -149,6 +166,11 @@ class ACTConfig(PreTrainedConfig):
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
             )
+        if self.action_delta_offset < 0:
+            raise ValueError(
+                f"action_delta_offset ({self.action_delta_offset}) cannot be negative: the action "
+                "chunk cannot start before the observation it is conditioned on."
+            )
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
@@ -169,7 +191,34 @@ class ACTConfig(PreTrainedConfig):
 
     @property
     def action_delta_indices(self) -> list:
-        return list(range(self.chunk_size))
+        """Indices for delta actions, shifted by ``action_delta_offset``."""
+        return list(range(self.action_delta_offset, self.action_delta_offset + self.chunk_size))
+
+    @property
+    def drop_n_last_frames(self) -> int:
+        """Exclude the episode tail frames whose action window is *entirely* out of bounds.
+
+        ACT does not need GR00T's ``max(action_delta_indices)`` here, and must not use it. GR00T has
+        no padding mask: it trains on every step of the chunk unconditionally, so any partially
+        out-of-bounds window would supervise fabricated zeros, and dropping ``max(indices)`` tail
+        frames is the only way to guarantee a complete chunk. ACT instead masks padded steps out of
+        the L1 loss (``valid_mask = ~batch["action_is_pad"]`` in ``ACTPolicy.forward``), so a
+        partially padded window is already handled correctly and is the *designed* behaviour for
+        every episode tail -- which is why upstream ACT leaves this at the sampler's 0 default.
+
+        What the offset newly breaks is the invariant that ACT did rely on: at offset 0, chunk step 0
+        targets ``t`` itself, so every sampled frame has at least one real supervised step. At offset
+        k the last k frames of an episode have *no* in-bounds step at all -- ``valid_mask`` is
+        entirely False, the L1 term is exactly zero, and (under ``use_vae``) the sample contributes a
+        pure-KLD gradient carrying no reconstruction signal. Dropping exactly k tail frames removes
+        exactly those frames and restores the invariant.
+
+        Equal to 0 whenever ``action_delta_offset`` is 0, so existing ACT runs are bit-identical.
+        Keying this off ``max(action_delta_indices)`` instead would drop ``chunk_size - 1`` frames at
+        the default offset -- 99 of every episode's tail at the default ``chunk_size``, discarding
+        most of a typical dataset and silently dropping short episodes outright.
+        """
+        return self.action_delta_offset
 
     @property
     def reward_delta_indices(self) -> None:
