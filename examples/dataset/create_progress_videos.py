@@ -43,6 +43,7 @@ import logging
 import subprocess
 from pathlib import Path
 
+import av
 import cv2
 import numpy as np
 import pandas as pd
@@ -399,12 +400,15 @@ def composite_progress_video(
     Returns:
         Path to the written output file (MP4).
     """
-    capture = cv2.VideoCapture(str(video_path))
+    # Decode with PyAV rather than cv2.VideoCapture: lerobot datasets commonly store
+    # video as AV1, which the ffmpeg build bundled in opencv-python(-headless) wheels
+    # cannot decode (cv2.VideoCapture silently returns ret=False on every read()),
+    # while PyAV's bundled libdav1d handles it correctly.
+    container = av.open(str(video_path))
+    stream = container.streams.video[0]
     try:
-        capture.set(cv2.CAP_PROP_POS_MSEC, from_timestamp * 1000)
-
-        frame_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-        frame_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        frame_width = stream.codec_context.width
+        frame_height = stream.codec_context.height
         duration_seconds = to_timestamp - from_timestamp
         num_frames = int(round(duration_seconds * fps))
 
@@ -439,9 +443,22 @@ def composite_progress_video(
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(str(output_path), fourcc, fps, (frame_width, frame_height))
 
+        # Seek to a keyframe at/before from_timestamp, then decode forward and drop
+        # any leading frames that landed before the episode's actual start.
+        seek_offset = int(from_timestamp / stream.time_base)
+        container.seek(seek_offset, stream=stream, any_frame=False, backward=True)
+
+        def _decoded_bgr_frames():
+            for av_frame in container.decode(stream):
+                if av_frame.time is not None and av_frame.time < from_timestamp - (0.5 / fps):
+                    continue
+                yield av_frame.to_ndarray(format="bgr24")
+
+        frame_iter = _decoded_bgr_frames()
+
         for frame_idx in range(num_frames):
-            ret, frame = capture.read()
-            if not ret:
+            frame = next(frame_iter, None)
+            if frame is None:
                 break
 
             drawn_count = int(np.searchsorted(frame_indices, frame_idx, side="right"))
@@ -515,7 +532,7 @@ def composite_progress_video(
 
         writer.release()
     finally:
-        capture.release()
+        container.close()
 
     logging.info("   MP4 written: %s", output_path)
     return output_path
@@ -538,10 +555,23 @@ def convert_mp4_to_gif(mp4_path: Path) -> Path:
     palette_path = mp4_path.parent / "_palette.png"
 
     logging.info("[4/4] Converting to GIF ...")
+    # -fflags +genpts and generous probe/analyze limits let ffmpeg recover timestamps
+    # and frames from MP4s whose duration metadata wasn't set by the writer (observed
+    # with some ffmpeg builds reading files muxed by OpenCV's bundled FFmpeg).
+    input_recovery_args = [
+        "-fflags",
+        "+genpts",
+        "-analyzeduration",
+        "100M",
+        "-probesize",
+        "100M",
+    ]
+
     result_palette = subprocess.run(  # nosec B607
         [
             "ffmpeg",
             "-y",
+            *input_recovery_args,
             "-i",
             str(mp4_path),
             "-vf",
@@ -560,6 +590,7 @@ def convert_mp4_to_gif(mp4_path: Path) -> Path:
         [
             "ffmpeg",
             "-y",
+            *input_recovery_args,
             "-i",
             str(mp4_path),
             "-i",
@@ -586,6 +617,7 @@ def process_dataset(
     output_dir: Path,
     create_gif: bool = False,
     progress_file: str = "sarm_progress.parquet",
+    task_name_override: str | None = None,
 ) -> Path | None:
     """Full pipeline: download, extract metadata, composite progress, write output.
 
@@ -597,6 +629,9 @@ def process_dataset(
         create_gif: If True, also generate a GIF from the MP4.
         progress_file: Filename of the per-frame progress parquet inside the
             dataset repo.
+        task_name_override: If set, shown as the title overlay instead of the
+            dataset's own stored task text (e.g. the exact prompt the reward
+            model was actually run with, which may differ from the dataset's).
 
     Returns:
         Path to the final output file, or None on failure.
@@ -627,7 +662,7 @@ def process_dataset(
         progress_data=progress_data,
         output_path=output_path,
         fps=episode_meta["fps"],
-        task_name=episode_meta.get("task_name", ""),
+        task_name=task_name_override if task_name_override is not None else episode_meta.get("task_name", ""),
     )
 
     if create_gif:
@@ -679,6 +714,15 @@ def main() -> None:
             "(default: 'sarm_progress.parquet')."
         ),
     )
+    parser.add_argument(
+        "--task-prompt",
+        type=str,
+        default=None,
+        help=(
+            "Show this text as the title overlay instead of the dataset's own stored task text "
+            "(e.g. the exact prompt the reward model was actually run with)."
+        ),
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -692,6 +736,7 @@ def main() -> None:
         output_dir=args.output_dir,
         create_gif=args.gif,
         progress_file=args.progress_file,
+        task_name_override=args.task_prompt,
     )
 
     if result:

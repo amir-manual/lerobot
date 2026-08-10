@@ -100,17 +100,33 @@ def compute_instruction_rewards_for_prefixes(
     image_key: str,
     num_samples: int | None,
     device: str,
+    target_fps: float | None = None,
 ) -> np.ndarray:
-    """Score an episode via prefix sweep and return a per-frame normalised curve."""
+    """Score an episode via prefix sweep and return a per-frame normalised curve.
+
+    Args:
+        target_fps: If set (and below the dataset's native fps), each prefix
+            window is uniformly subsampled to approximately this playback
+            rate before being sent to the VLM, instead of every native frame.
+            Keeps the number of frames per model call bounded independent of
+            prefix length, and matches what the encoder's own ``fps`` value
+            already claims in its video metadata.
+    """
     if num_samples is None or num_samples >= num_frames:
         prefix_lengths = np.arange(1, num_frames + 1, dtype=np.int64)
     else:
         prefix_lengths = np.unique(np.linspace(1, num_frames, num_samples).round().astype(np.int64))
 
     episode_frames = torch.stack([dataset[ep_start + i][image_key] for i in range(num_frames)])
+    native_fps = dataset.fps
     rewards: list[float] = []
     for length in prefix_lengths:
-        frames = episode_frames[: int(length)].unsqueeze(0)  # (1, T, C, H, W)
+        window = episode_frames[: int(length)]
+        if target_fps is not None and target_fps < native_fps:
+            sampled_count = max(1, min(int(length), round(int(length) / native_fps * target_fps)))
+            sample_idx = np.linspace(0, int(length) - 1, sampled_count).round().astype(np.int64)
+            window = window[sample_idx]
+        frames = window.unsqueeze(0)  # (1, T, C, H, W)
 
         transition = {
             TransitionKey.OBSERVATION: {image_key: frames},
@@ -147,8 +163,16 @@ def compute_topreward_progress(
     num_samples: int | None = None,
     fps: float | None = None,
     episodes: list[int] | None = None,
+    task_prompt: str | None = None,
 ) -> Path:
-    """Run TOPReward over a dataset and write per-frame progress."""
+    """Run TOPReward over a dataset and write per-frame progress.
+
+    Args:
+        task_prompt: If set, used verbatim as the task instruction for every
+            episode, overriding both the dataset's own per-episode task text
+            and ``config.default_task``.
+    """
+
     if reward_model_path is not None:
         logging.info(f"Loading TOPReward config from: {reward_model_path}")
         model = TOPRewardModel.from_pretrained(reward_model_path)
@@ -166,6 +190,7 @@ def compute_topreward_progress(
             config_kwargs["fps"] = fps
         config = TOPRewardConfig(**config_kwargs)
         logging.info(f"Constructing TOPReward with VLM: {config.vlm_name}")
+        print(f"Constructing TOPReward with VLM: {config.vlm_name}")
         model = TOPRewardModel(config)
 
     model.to(device).eval()
@@ -205,8 +230,11 @@ def compute_topreward_progress(
         if num_frames <= 0:
             continue
 
-        first_sample = dataset[ep_start]
-        task = _resolve_task(first_sample, default=config.default_task or "perform the task")
+        if task_prompt is not None:
+            task = task_prompt
+        else:
+            first_sample = dataset[ep_start]
+            task = _resolve_task(first_sample, default=config.default_task or "perform the task")
 
         per_frame = compute_instruction_rewards_for_prefixes(
             model=model,
@@ -218,6 +246,7 @@ def compute_topreward_progress(
             image_key=image_key,
             num_samples=num_samples,
             device=device,
+            target_fps=config.fps,
         )
 
         for local in range(num_frames):
@@ -241,6 +270,8 @@ def compute_topreward_progress(
     schema_metadata: dict[bytes, bytes] = {b"vlm_name": config.vlm_name.encode()}
     if reward_model_path is not None:
         schema_metadata[b"reward_model_path"] = reward_model_path.encode()
+    if task_prompt is not None:
+        schema_metadata[b"task_prompt"] = task_prompt.encode()
     table = table.replace_schema_metadata(schema_metadata)
 
     out = Path(dataset.root) / DEFAULT_OUTPUT_FILENAME if output_path is None else Path(output_path)
@@ -300,6 +331,13 @@ Examples:
     )
     parser.add_argument("--fps", type=float, default=None, help="Override TOPRewardConfig.fps.")
     parser.add_argument(
+        "--task-prompt",
+        type=str,
+        default=None,
+        help="Override the task instruction used for every episode, ignoring the dataset's own "
+        "per-episode task text and --reward-model-path's default_task.",
+    )
+    parser.add_argument(
         "--push-to-hub", action="store_true", help="Upload to the dataset repo on HuggingFace Hub."
     )
 
@@ -316,6 +354,7 @@ Examples:
         num_samples=args.num_samples,
         fps=args.fps,
         episodes=args.episodes,
+        task_prompt=args.task_prompt,
     )
 
     print(f"\nTOPReward progress saved to: {output_path}")

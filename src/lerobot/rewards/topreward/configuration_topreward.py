@@ -84,7 +84,7 @@ class TOPRewardConfig(RewardModelConfig):
     torch_dtype: str = "auto"
     attn_implementation: str | None = None
 
-    image_key: str = OBS_IMAGES + ".top"
+    image_key: str = OBS_IMAGES + ".base"
     task_key: str = "task"
     default_task: str | None = None
     max_frames: int | None = 16
