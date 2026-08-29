@@ -147,7 +147,7 @@ class ACTPolicy(PreTrainedPolicy):
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
-        actions_hat, (mu_hat, log_sigma_x2_hat), (phase_logits, finger_pred) = self.model(batch)
+        actions_hat, (mu_hat, log_sigma_x2_hat), (phase_logits, finger_pred, progress_pred) = self.model(batch)
 
         abs_err = F.l1_loss(batch[ACTION], actions_hat, reduction="none")
         valid_mask = ~batch["action_is_pad"].unsqueeze(-1)
@@ -174,10 +174,15 @@ class ACTPolicy(PreTrainedPolicy):
             if self.config.predict_aux_heads:
                 phase_target = batch["phase_label"].reshape(-1).long()
                 finger_target = batch["finger_state_target"].float()
+                progress_target = batch["phase_progress_target"].reshape(-1).float()
                 per_sample_phase = F.cross_entropy(phase_logits, phase_target, reduction="none")
                 per_sample_finger = F.mse_loss(finger_pred, finger_target, reduction="none").mean(dim=-1)
+                per_sample_progress = F.mse_loss(
+                    progress_pred.squeeze(-1), progress_target, reduction="none"
+                )
                 loss_dict["phase_loss"] = per_sample_phase.mean().item()
                 loss_dict["finger_loss"] = per_sample_finger.mean().item()
+                loss_dict["progress_loss"] = per_sample_progress.mean().item()
                 loss_dict["phase_accuracy"] = (
                     (phase_logits.argmax(dim=-1) == phase_target).float().mean().item()
                 )
@@ -185,6 +190,7 @@ class ACTPolicy(PreTrainedPolicy):
                     per_sample_loss
                     + self.config.phase_loss_weight * per_sample_phase
                     + self.config.finger_loss_weight * per_sample_finger
+                    + self.config.progress_loss_weight * per_sample_progress
                 )
             return per_sample_loss, loss_dict
 
@@ -208,22 +214,31 @@ class ACTPolicy(PreTrainedPolicy):
         if self.config.predict_aux_heads:
             phase_target = batch["phase_label"].reshape(-1).long()
             finger_target = batch["finger_state_target"].float()
+            progress_target = batch["phase_progress_target"].reshape(-1).float()
             phase_loss = F.cross_entropy(phase_logits, phase_target)
             finger_loss = F.mse_loss(finger_pred, finger_target)
+            progress_loss = F.mse_loss(progress_pred.squeeze(-1), progress_target)
             loss_dict["phase_loss"] = phase_loss.item()
             loss_dict["finger_loss"] = finger_loss.item()
+            loss_dict["progress_loss"] = progress_loss.item()
             loss_dict["phase_accuracy"] = (phase_logits.argmax(dim=-1) == phase_target).float().mean().item()
-            loss = loss + self.config.phase_loss_weight * phase_loss + self.config.finger_loss_weight * finger_loss
+            loss = (
+                loss
+                + self.config.phase_loss_weight * phase_loss
+                + self.config.finger_loss_weight * finger_loss
+                + self.config.progress_loss_weight * progress_loss
+            )
 
         return loss, loss_dict
 
     @torch.no_grad()
-    def predict_action_chunk_with_aux(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
+    def predict_action_chunk_with_aux(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """Like `predict_action_chunk`, but also returns the auxiliary heads' predictions.
 
         Requires `config.predict_aux_heads`. Kept separate from `predict_action_chunk` (which
         callers -- rollout, `select_action`, open-loop eval -- use unchanged) so this is purely
-        additive: the diagnostic harness that needs phase/finger predictions calls this instead.
+        additive: the diagnostic harness that needs phase/finger/progress predictions calls this
+        instead.
         """
         if not self.config.predict_aux_heads:
             raise ValueError(
@@ -236,8 +251,8 @@ class ACTPolicy(PreTrainedPolicy):
             batch = dict(batch)
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
-        actions, _, (phase_logits, finger_pred) = self.model(batch)
-        return actions, phase_logits, finger_pred
+        actions, _, (phase_logits, finger_pred, progress_pred) = self.model(batch)
+        return actions, phase_logits, finger_pred, progress_pred
 
 
 class ACTTemporalEnsembler:
@@ -453,6 +468,7 @@ class ACT(nn.Module):
         if self.config.predict_aux_heads:
             self.phase_head = nn.Linear(config.dim_model, config.num_phase_classes)
             self.finger_head = nn.Linear(config.dim_model, config.num_finger_channels)
+            self.progress_head = nn.Linear(config.dim_model, 1)
 
         self._reset_parameters()
 
@@ -467,7 +483,7 @@ class ACT(nn.Module):
     ) -> tuple[
         Tensor,
         tuple[Tensor, Tensor] | tuple[None, None],
-        tuple[Tensor, Tensor] | tuple[None, None],
+        tuple[Tensor, Tensor, Tensor] | tuple[None, None, None],
     ]:
         """A forward pass through the Action Chunking Transformer (with optional VAE encoder).
 
@@ -486,8 +502,9 @@ class ACT(nn.Module):
             (B, chunk_size, action_dim) batch of action sequences
             Tuple containing the latent PDF's parameters (mean, log(σ²)) both as (B, L) tensors where L is the
             latent dimension.
-            Tuple containing the auxiliary heads' predictions (phase_logits, finger_pred), both
-            `(None, None)` unless `config.predict_aux_heads` is set -- see ACTConfig.
+            Tuple containing the auxiliary heads' predictions (phase_logits, finger_pred,
+            progress_pred), all `(None, None, None)` unless `config.predict_aux_heads` is set --
+            see ACTConfig.
         """
         if self.config.use_vae and self.training:
             assert ACTION in batch, (
@@ -611,10 +628,11 @@ class ACT(nn.Module):
             pooled = encoder_out[1:].mean(dim=0)  # (B, D)
             phase_logits = self.phase_head(pooled)
             finger_pred = self.finger_head(pooled)
+            progress_pred = self.progress_head(pooled)
         else:
-            phase_logits = finger_pred = None
+            phase_logits = finger_pred = progress_pred = None
 
-        return actions, (mu, log_sigma_x2), (phase_logits, finger_pred)
+        return actions, (mu, log_sigma_x2), (phase_logits, finger_pred, progress_pred)
 
 
 class ACTEncoder(nn.Module):
