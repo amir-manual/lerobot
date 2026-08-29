@@ -147,7 +147,7 @@ class ACTPolicy(PreTrainedPolicy):
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
-        actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
+        actions_hat, (mu_hat, log_sigma_x2_hat), (phase_logits, finger_pred) = self.model(batch)
 
         abs_err = F.l1_loss(batch[ACTION], actions_hat, reduction="none")
         valid_mask = ~batch["action_is_pad"].unsqueeze(-1)
@@ -170,6 +170,22 @@ class ACTPolicy(PreTrainedPolicy):
                 per_sample_loss = per_sample_l1 + per_sample_kld * self.config.kl_weight
             else:
                 per_sample_loss = per_sample_l1
+
+            if self.config.predict_aux_heads:
+                phase_target = batch["phase_label"].reshape(-1).long()
+                finger_target = batch["finger_state_target"].float()
+                per_sample_phase = F.cross_entropy(phase_logits, phase_target, reduction="none")
+                per_sample_finger = F.mse_loss(finger_pred, finger_target, reduction="none").mean(dim=-1)
+                loss_dict["phase_loss"] = per_sample_phase.mean().item()
+                loss_dict["finger_loss"] = per_sample_finger.mean().item()
+                loss_dict["phase_accuracy"] = (
+                    (phase_logits.argmax(dim=-1) == phase_target).float().mean().item()
+                )
+                per_sample_loss = (
+                    per_sample_loss
+                    + self.config.phase_loss_weight * per_sample_phase
+                    + self.config.finger_loss_weight * per_sample_finger
+                )
             return per_sample_loss, loss_dict
 
         num_valid = valid_mask.sum() * abs_err.shape[-1]
@@ -189,7 +205,39 @@ class ACTPolicy(PreTrainedPolicy):
         else:
             loss = l1_loss
 
+        if self.config.predict_aux_heads:
+            phase_target = batch["phase_label"].reshape(-1).long()
+            finger_target = batch["finger_state_target"].float()
+            phase_loss = F.cross_entropy(phase_logits, phase_target)
+            finger_loss = F.mse_loss(finger_pred, finger_target)
+            loss_dict["phase_loss"] = phase_loss.item()
+            loss_dict["finger_loss"] = finger_loss.item()
+            loss_dict["phase_accuracy"] = (phase_logits.argmax(dim=-1) == phase_target).float().mean().item()
+            loss = loss + self.config.phase_loss_weight * phase_loss + self.config.finger_loss_weight * finger_loss
+
         return loss, loss_dict
+
+    @torch.no_grad()
+    def predict_action_chunk_with_aux(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
+        """Like `predict_action_chunk`, but also returns the auxiliary heads' predictions.
+
+        Requires `config.predict_aux_heads`. Kept separate from `predict_action_chunk` (which
+        callers -- rollout, `select_action`, open-loop eval -- use unchanged) so this is purely
+        additive: the diagnostic harness that needs phase/finger predictions calls this instead.
+        """
+        if not self.config.predict_aux_heads:
+            raise ValueError(
+                "predict_action_chunk_with_aux requires config.predict_aux_heads=True; this "
+                "checkpoint was not trained with auxiliary heads."
+            )
+        self.eval()
+
+        if self.config.image_features:
+            batch = dict(batch)
+            batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+
+        actions, _, (phase_logits, finger_pred) = self.model(batch)
+        return actions, phase_logits, finger_pred
 
 
 class ACTTemporalEnsembler:
@@ -397,6 +445,15 @@ class ACT(nn.Module):
         # Final action regression head on the output of the transformer's decoder.
         self.action_head = nn.Linear(config.dim_model, self.config.action_feature.shape[0])
 
+        # Optional auxiliary heads, built only when requested (see ACTConfig.predict_aux_heads).
+        # Pool the transformer ENCODER's output (not the decoder's) -- the encoder has already
+        # fused state/image tokens into one representation per forward() call below, which is
+        # exactly the "what does the model currently believe about the scene" signal these heads
+        # are meant to probe, before the decoder specialises it into a specific action sequence.
+        if self.config.predict_aux_heads:
+            self.phase_head = nn.Linear(config.dim_model, config.num_phase_classes)
+            self.finger_head = nn.Linear(config.dim_model, config.num_finger_channels)
+
         self._reset_parameters()
 
     def _reset_parameters(self):
@@ -405,7 +462,13 @@ class ACT(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
+    def forward(
+        self, batch: dict[str, Tensor]
+    ) -> tuple[
+        Tensor,
+        tuple[Tensor, Tensor] | tuple[None, None],
+        tuple[Tensor, Tensor] | tuple[None, None],
+    ]:
         """A forward pass through the Action Chunking Transformer (with optional VAE encoder).
 
         `batch` should have the following structure:
@@ -423,6 +486,8 @@ class ACT(nn.Module):
             (B, chunk_size, action_dim) batch of action sequences
             Tuple containing the latent PDF's parameters (mean, log(σ²)) both as (B, L) tensors where L is the
             latent dimension.
+            Tuple containing the auxiliary heads' predictions (phase_logits, finger_pred), both
+            `(None, None)` unless `config.predict_aux_heads` is set -- see ACTConfig.
         """
         if self.config.use_vae and self.training:
             assert ACTION in batch, (
@@ -537,7 +602,19 @@ class ACT(nn.Module):
 
         actions = self.action_head(decoder_out)
 
-        return actions, (mu, log_sigma_x2)
+        if self.config.predict_aux_heads:
+            # encoder_out is (S, B, D); token 0 is encoder_latent_input_proj(latent_sample) -- the
+            # VAE latent, which is a real function of the ground-truth action during training but
+            # is FORCED TO ZERO at inference (see the `else` branch above). Pooling on it would
+            # make these heads' predictions look fine in training and constant at inference, so
+            # the pool deliberately excludes it and averages only the state/image tokens.
+            pooled = encoder_out[1:].mean(dim=0)  # (B, D)
+            phase_logits = self.phase_head(pooled)
+            finger_pred = self.finger_head(pooled)
+        else:
+            phase_logits = finger_pred = None
+
+        return actions, (mu, log_sigma_x2), (phase_logits, finger_pred)
 
 
 class ACTEncoder(nn.Module):

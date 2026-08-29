@@ -127,6 +127,17 @@ class ACTConfig(PreTrainedConfig):
     optimizer_weight_decay: float = 1e-4
     optimizer_lr_backbone: float = 1e-5
 
+    # Auxiliary heads: optional task-phase classification + finger-state regression, trained
+    # alongside the primary action loss so a later eval can compare predicted-vs-actual
+    # phase/finger-state to distinguish planning failures (wrong macro-phase) from execution
+    # failures (right phase, wrong finger state). `False` is a no-op -- no extra heads are built,
+    # no extra batch keys are read, and forward()'s return signature is unchanged.
+    predict_aux_heads: bool = False
+    num_phase_classes: int = 5
+    num_finger_channels: int = 4
+    phase_loss_weight: float = 1.0
+    finger_loss_weight: float = 1.0
+
     def __post_init__(self):
         super().__post_init__()
 

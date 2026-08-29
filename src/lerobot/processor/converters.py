@@ -164,6 +164,13 @@ _COMPLEMENTARY_KEYS = (
     "messages",
     "message_streams",
     "target_message_indices",
+    # Auxiliary supervision targets for ACT's optional phase/finger-state heads (see
+    # ACTConfig.predict_aux_heads). Neither an "observation.*" feature nor the primary "action"
+    # key, but must still survive batch_to_transition/transition_to_batch's round-trip the same
+    # way "task"/"episode_index" already do -- this allowlist is the mechanism this pipeline
+    # already uses for exactly this kind of per-frame metadata that isn't an observation or action.
+    "phase_label",
+    "finger_state_target",
 )
 
 
