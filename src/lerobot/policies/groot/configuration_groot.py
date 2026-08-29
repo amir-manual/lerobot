@@ -398,16 +398,18 @@ class GrootConfig(PreTrainedConfig):
     report_to: str = "wandb"
     resume: bool = False
 
-    # Optional auxiliary heads: task-phase classification + finger-state regression, trained
-    # alongside the diffusion action loss so a later eval can compare predicted-vs-actual
-    # phase/finger-state to distinguish planning failures from execution failures. `False` is a
-    # no-op -- no extra heads built, no extra batch keys read. Forwarded to GR00TN17Config as
-    # overrides in GrootPolicy._create_groot_model (see GR00T_N1_7_DEFAULTS in groot_n1_7.py).
+    # Optional auxiliary heads: task-phase classification + finger-state regression + subgoal-end
+    # (in-phase progress) regression, trained alongside the diffusion action loss so a later eval
+    # can compare predicted-vs-actual phase/finger-state/progress to distinguish planning failures
+    # from execution failures, SADP/SeqVLA-style. `False` is a no-op -- no extra heads built, no
+    # extra batch keys read. Forwarded to GR00TN17Config as overrides in
+    # GrootPolicy._create_groot_model (see GR00T_N1_7_DEFAULTS in groot_n1_7.py).
     predict_aux_heads: bool = False
     num_phase_classes: int = 5
     num_finger_channels: int = 4
     phase_loss_weight: float = 1.0
     finger_loss_weight: float = 1.0
+    progress_loss_weight: float = 1.0
 
     def __post_init__(self):
         if self.tokenizer_assets_repo is not None:

@@ -152,6 +152,7 @@ GR00T_N1_7_DEFAULTS: dict[str, Any] = {
     "num_finger_channels": 4,
     "phase_loss_weight": 1.0,
     "finger_loss_weight": 1.0,
+    "progress_loss_weight": 1.0,
 }
 
 
@@ -865,6 +866,7 @@ class GR00TN17(PreTrainedModel):
         if config.predict_aux_heads:
             self.phase_head = nn.Linear(config.backbone_embedding_dim, config.num_phase_classes)
             self.finger_head = nn.Linear(config.backbone_embedding_dim, config.num_finger_channels)
+            self.progress_head = nn.Linear(config.backbone_embedding_dim, 1)
 
         self.post_init()
 
@@ -902,10 +904,12 @@ class GR00TN17(PreTrainedModel):
             pooled = (backbone_outputs["backbone_features"] * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1e-6)
             phase_logits = self.phase_head(pooled)
             finger_pred = self.finger_head(pooled)
+            progress_pred = self.progress_head(pooled)
         outputs = self.action_head(backbone_outputs, action_inputs)
         if self.config.predict_aux_heads:
             outputs["phase_logits"] = phase_logits
             outputs["finger_pred"] = finger_pred
+            outputs["progress_pred"] = progress_pred
         return outputs
 
     def get_action(self, inputs: dict[str, Any], options: dict[str, Any] | None = None) -> BatchFeature:
@@ -920,10 +924,12 @@ class GR00TN17(PreTrainedModel):
             pooled = (backbone_outputs["backbone_features"] * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1e-6)
             phase_logits = self.phase_head(pooled)
             finger_pred = self.finger_head(pooled)
+            progress_pred = self.progress_head(pooled)
         outputs = self.action_head.get_action(backbone_outputs, action_inputs, options)
         if self.config.predict_aux_heads:
             outputs["phase_logits"] = phase_logits
             outputs["finger_pred"] = finger_pred
+            outputs["progress_pred"] = progress_pred
         return outputs
 
     @property
