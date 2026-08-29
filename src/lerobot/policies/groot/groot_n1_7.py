@@ -144,6 +144,14 @@ GR00T_N1_7_DEFAULTS: dict[str, Any] = {
     "use_mean_std": False,
     "max_num_embodiments": 32,
     "rtc_ramp_rate": 6.0,
+    # Optional auxiliary heads: task-phase classification + finger-state regression, trained
+    # alongside the diffusion action loss so a later eval can compare predicted-vs-actual
+    # phase/finger-state. False is a no-op -- no extra heads built, no extra forward-pass cost.
+    "predict_aux_heads": False,
+    "num_phase_classes": 5,
+    "num_finger_channels": 4,
+    "phase_loss_weight": 1.0,
+    "finger_loss_weight": 1.0,
 }
 
 
@@ -847,6 +855,17 @@ class GR00TN17(PreTrainedModel):
             load_pretrained_weights=load_backbone_weights,
         )
         self.action_head = GR00TN17ActionHead(config)
+
+        # Optional auxiliary heads, built only when requested (see GR00T_N1_7_DEFAULTS above).
+        # Pool the BACKBONE's output (backbone_features, before the diffusion action_head ever
+        # sees it) -- this is the VLM's fused vision-language representation of the current
+        # observation, independent of the action head's noisy-trajectory/timestep conditioning,
+        # which is exactly the "what does the model currently believe about the scene" signal
+        # these heads are meant to probe.
+        if config.predict_aux_heads:
+            self.phase_head = nn.Linear(config.backbone_embedding_dim, config.num_phase_classes)
+            self.finger_head = nn.Linear(config.backbone_embedding_dim, config.num_finger_channels)
+
         self.post_init()
 
     def prepare_input(self, inputs: dict[str, Any]) -> tuple[BatchFeature, BatchFeature]:
@@ -869,12 +888,43 @@ class GR00TN17(PreTrainedModel):
     def forward(self, inputs: dict[str, Any]) -> BatchFeature:
         backbone_inputs, action_inputs = self.prepare_input(inputs)
         backbone_outputs = self.backbone(backbone_inputs)
-        return self.action_head(backbone_outputs, action_inputs)
+        if self.config.predict_aux_heads:
+            # Pool BEFORE self.action_head(...) -- GR00TN17ActionHead.forward's
+            # process_backbone_output mutates backbone_outputs["backbone_features"] IN PLACE
+            # (BatchFeature is a plain mutable mapping), overwriting it with the vlln/self-attention
+            # -refined version used for diffusion conditioning. Pooling after that call would
+            # silently read the action head's own intermediate representation instead of the
+            # backbone's raw output -- computing this first is what actually keeps the two
+            # representations distinct.
+            mask = backbone_outputs["backbone_attention_mask"].unsqueeze(-1).to(
+                backbone_outputs["backbone_features"].dtype
+            )
+            pooled = (backbone_outputs["backbone_features"] * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1e-6)
+            phase_logits = self.phase_head(pooled)
+            finger_pred = self.finger_head(pooled)
+        outputs = self.action_head(backbone_outputs, action_inputs)
+        if self.config.predict_aux_heads:
+            outputs["phase_logits"] = phase_logits
+            outputs["finger_pred"] = finger_pred
+        return outputs
 
     def get_action(self, inputs: dict[str, Any], options: dict[str, Any] | None = None) -> BatchFeature:
         backbone_inputs, action_inputs = self.prepare_input(inputs)
         backbone_outputs = self.backbone(backbone_inputs)
-        return self.action_head.get_action(backbone_outputs, action_inputs, options)
+        if self.config.predict_aux_heads:
+            # Same ordering requirement as forward() above: action_head.get_action ->
+            # _encode_features mutates backbone_outputs["backbone_features"] in place too.
+            mask = backbone_outputs["backbone_attention_mask"].unsqueeze(-1).to(
+                backbone_outputs["backbone_features"].dtype
+            )
+            pooled = (backbone_outputs["backbone_features"] * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1e-6)
+            phase_logits = self.phase_head(pooled)
+            finger_pred = self.finger_head(pooled)
+        outputs = self.action_head.get_action(backbone_outputs, action_inputs, options)
+        if self.config.predict_aux_heads:
+            outputs["phase_logits"] = phase_logits
+            outputs["finger_pred"] = finger_pred
+        return outputs
 
     @property
     def device(self) -> torch.device:

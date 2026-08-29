@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TypeVar
 
 import torch
+import torch.nn.functional as F  # noqa: N812
 from huggingface_hub import hf_hub_download
 from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
 from huggingface_hub.errors import HfHubHTTPError
@@ -103,6 +104,16 @@ class GrootPolicy(PreTrainedPolicy):
             model_kwargs["num_inference_timesteps"] = self.config.num_inference_timesteps
         if self.config.rtc_ramp_rate is not None:
             model_kwargs["rtc_ramp_rate"] = self.config.rtc_ramp_rate
+        if self.config.predict_aux_heads:
+            # Only forwarded when enabled -- an old checkpoint saved before this option existed
+            # has no phase_head/finger_head in its state dict, and passing predict_aux_heads=True
+            # unconditionally would build those layers randomly-initialised every load. Loading
+            # such a checkpoint into a NEW aux-head-enabled config still needs an explicit
+            # strict=False at the GrootPolicy.from_pretrained call site (its default is
+            # strict=True, unlike ACT) for the same reason ACT needs it.
+            model_kwargs["predict_aux_heads"] = True
+            model_kwargs["num_phase_classes"] = self.config.num_phase_classes
+            model_kwargs["num_finger_channels"] = self.config.num_finger_channels
 
         model = GR00TN17.from_pretrained(
             **model_kwargs,
@@ -327,6 +338,11 @@ class GrootPolicy(PreTrainedPolicy):
         allowed_base = {"state", "state_mask", "action_mask", "embodiment_id"}
         if include_action:
             allowed_base.add("action")
+        if self.config.predict_aux_heads:
+            # Auxiliary supervision targets for the optional phase/finger-state heads (see
+            # GrootConfig.predict_aux_heads). Without this, both are silently dropped here before
+            # GR00TN17.forward ever runs -- this allow-list is a hard filter, not a passthrough.
+            allowed_base.update({"phase_label", "finger_state_target"})
 
         allowed_base.update(
             {
@@ -476,6 +492,31 @@ class GrootPolicy(PreTrainedPolicy):
 
         loss_dict = {"loss": loss.item()}
 
+        if self.config.predict_aux_heads:
+            phase_logits = outputs.get("phase_logits")
+            finger_pred = outputs.get("finger_pred")
+            if phase_logits is None or finger_pred is None:
+                raise RuntimeError(
+                    "config.predict_aux_heads is set but GR00TN17.forward did not return "
+                    "phase_logits/finger_pred -- check that the model was built with the same "
+                    "config (predict_aux_heads must be threaded through GR00TN17Config, not just "
+                    "GrootConfig)."
+                )
+            # Read the labels from the ORIGINAL batch, not groot_inputs -- _filter_groot_inputs
+            # already allow-lists them through to groot_inputs too, but GR00TN17.forward's own
+            # prepare_input chain only picks out the specific keys it needs and would silently
+            # ignore them there; reading from `batch` directly has no such dependency.
+            phase_target = batch["phase_label"].reshape(-1).long().to(phase_logits.device)
+            finger_target = batch["finger_state_target"].float().to(finger_pred.device)
+            phase_loss = F.cross_entropy(phase_logits.float(), phase_target)
+            finger_loss = F.mse_loss(finger_pred.float(), finger_target)
+            loss_dict["phase_loss"] = phase_loss.item()
+            loss_dict["finger_loss"] = finger_loss.item()
+            loss_dict["phase_accuracy"] = (
+                (phase_logits.argmax(dim=-1) == phase_target).float().mean().item()
+            )
+            loss = loss + self.config.phase_loss_weight * phase_loss + self.config.finger_loss_weight * finger_loss
+
         return loss, loss_dict
 
     @torch.no_grad()
@@ -526,6 +567,37 @@ class GrootPolicy(PreTrainedPolicy):
         actions = actions[:, :, :original_action_dim]
 
         return actions
+
+    @torch.no_grad()
+    def predict_action_chunk_with_aux(self, batch: dict[str, Tensor], **kwargs: object) -> tuple[Tensor, Tensor, Tensor]:
+        """Like `predict_action_chunk`, but also returns the auxiliary heads' predictions.
+
+        Requires `config.predict_aux_heads`. Kept separate from `predict_action_chunk` (which
+        rollout/eval callers use unchanged) so this is purely additive: the diagnostic harness
+        that needs phase/finger predictions calls this instead. Does not support the RTC
+        overlap-guidance kwargs `predict_action_chunk` takes -- the diagnostic harness scores
+        recorded episodes frame-by-frame and has no use for cross-chunk overlap.
+        """
+        if not self.config.predict_aux_heads:
+            raise ValueError(
+                "predict_action_chunk_with_aux requires config.predict_aux_heads=True; this "
+                "checkpoint was not trained with auxiliary heads."
+            )
+        self.eval()
+
+        groot_inputs = self._filter_groot_inputs(batch, include_action=False)
+        device = get_device_from_parameters(self)
+
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=self.config.use_bf16):
+            outputs = self._groot_model.get_action(groot_inputs)
+
+        actions = outputs.get("action_pred")
+        prediction_horizon = self._resolve_prediction_horizon(actions)
+        actions = actions[:, :prediction_horizon]
+        original_action_dim = self.config.output_features[ACTION].shape[0]
+        actions = actions[:, :, :original_action_dim]
+
+        return actions, outputs.get("phase_logits"), outputs.get("finger_pred")
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
