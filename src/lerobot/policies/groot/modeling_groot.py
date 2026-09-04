@@ -340,10 +340,12 @@ class GrootPolicy(PreTrainedPolicy):
             allowed_base.add("action")
         if self.config.predict_aux_heads:
             # Auxiliary supervision targets for the optional phase/finger-state/subgoal-end heads
-            # (see GrootConfig.predict_aux_heads). Without this, all three are silently dropped
-            # here before GR00TN17.forward ever runs -- this allow-list is a hard filter, not a
-            # passthrough.
-            allowed_base.update({"phase_label", "finger_state_target", "phase_progress_target"})
+            # (see GrootConfig.predict_aux_heads). Without this, these are silently dropped here
+            # before GR00TN17.forward ever runs -- this allow-list is a hard filter, not a
+            # passthrough. phase3_label rides along even though no head consumes it yet (see
+            # publish_aux_label_branch.py) -- letting it survive the batch now avoids re-hitting
+            # the same silent-drop gotcha later when a head is wired up.
+            allowed_base.update({"phase_label", "phase3_label", "finger_state_target", "phase_progress_target"})
 
         allowed_base.update(
             {
@@ -508,7 +510,7 @@ class GrootPolicy(PreTrainedPolicy):
             # already allow-lists them through to groot_inputs too, but GR00TN17.forward's own
             # prepare_input chain only picks out the specific keys it needs and would silently
             # ignore them there; reading from `batch` directly has no such dependency.
-            phase_target = batch["phase_label"].reshape(-1).long().to(phase_logits.device)
+            phase_target = batch[self.config.phase_label_key].reshape(-1).long().to(phase_logits.device)
             finger_target = batch["finger_state_target"].float().to(finger_pred.device)
             progress_target = batch["phase_progress_target"].reshape(-1).float().to(progress_pred.device)
             phase_loss = F.cross_entropy(phase_logits.float(), phase_target)

@@ -172,7 +172,7 @@ class ACTPolicy(PreTrainedPolicy):
                 per_sample_loss = per_sample_l1
 
             if self.config.predict_aux_heads:
-                phase_target = batch["phase_label"].reshape(-1).long()
+                phase_target = batch[self.config.phase_label_key].reshape(-1).long()
                 finger_target = batch["finger_state_target"].float()
                 progress_target = batch["phase_progress_target"].reshape(-1).float()
                 per_sample_phase = F.cross_entropy(phase_logits, phase_target, reduction="none")
@@ -212,7 +212,7 @@ class ACTPolicy(PreTrainedPolicy):
             loss = l1_loss
 
         if self.config.predict_aux_heads:
-            phase_target = batch["phase_label"].reshape(-1).long()
+            phase_target = batch[self.config.phase_label_key].reshape(-1).long()
             finger_target = batch["finger_state_target"].float()
             progress_target = batch["phase_progress_target"].reshape(-1).float()
             phase_loss = F.cross_entropy(phase_logits, phase_target)

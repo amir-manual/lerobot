@@ -410,6 +410,13 @@ class GrootConfig(PreTrainedConfig):
     phase_loss_weight: float = 1.0
     finger_loss_weight: float = 1.0
     progress_loss_weight: float = 1.0
+    # Which batch key phase_head's target comes from -- "phase_label" (5-way
+    # idle/approaching/grasping/transporting/releasing) by default, or "phase3_label" (4-way
+    # idle/reaching/operating/moving_away) with num_phase_classes=4. Both keys are pushed together
+    # by publish_aux_label_branch.py; this just picks which one phase_head is trained against.
+    # Only read in GrootPolicy.forward (this config) -- GR00TN17Config's own head construction
+    # only needs num_phase_classes, never the batch key name.
+    phase_label_key: str = "phase_label"
 
     def __post_init__(self):
         if self.tokenizer_assets_repo is not None:

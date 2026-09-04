@@ -171,6 +171,7 @@ _COMPLEMENTARY_KEYS = (
     # this pipeline already uses for exactly this kind of per-frame metadata that isn't an
     # observation or action.
     "phase_label",
+    "phase3_label",
     "finger_state_target",
     "phase_progress_target",
 )
